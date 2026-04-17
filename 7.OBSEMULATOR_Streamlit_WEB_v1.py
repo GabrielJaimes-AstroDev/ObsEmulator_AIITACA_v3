@@ -1302,6 +1302,215 @@ def run_cube_worker(cfg_path: str) -> int:
 	return 0
 
 
+def _write_map_fits_2d(out_fits_path: str, map_2d: np.ndarray, ref_hdr: Optional[object], history_text: str):
+	if fits is None:
+		return
+	arr = np.asarray(map_2d, dtype=np.float32)
+	hdr = fits.Header()
+	hdr["WCSAXES"] = 2
+	hdr["BUNIT"] = "a.u."
+	if ref_hdr is not None:
+		for k in ["CTYPE1", "CTYPE2", "CUNIT1", "CUNIT2", "CRPIX1", "CRPIX2", "CRVAL1", "CRVAL2", "CDELT1", "CDELT2", "CROTA1", "CROTA2", "RADESYS", "EQUINOX", "LONPOLE", "LATPOLE"]:
+			if k in ref_hdr:
+				hdr[k] = ref_hdr[k]
+		for k in ref_hdr.keys():
+			ks = str(k)
+			if ks.startswith("CD1_") or ks.startswith("CD2_") or ks.startswith("PC1_") or ks.startswith("PC2_"):
+				hdr[ks] = ref_hdr[ks]
+	hdr["HISTORY"] = str(history_text)
+	fits.writeto(out_fits_path, arr, header=hdr, overwrite=True)
+
+
+def _save_cubefit_progress_png(
+	logn_map: np.ndarray,
+	tex_map: np.ndarray,
+	velo_map: np.ndarray,
+	fwhm_map: np.ndarray,
+	done_steps: int,
+	total_steps: int,
+	out_png: str,
+):
+	fig, axes = plt.subplots(2, 2, figsize=(8.6, 7.4))
+	items = [
+		("logN", np.asarray(logn_map, dtype=np.float32), "viridis"),
+		("Tex", np.asarray(tex_map, dtype=np.float32), "magma"),
+		("Velocity", np.asarray(velo_map, dtype=np.float32), "coolwarm"),
+		("FWHM", np.asarray(fwhm_map, dtype=np.float32), "plasma"),
+	]
+	for ax, (ttl, arr, cmap) in zip(axes.ravel(), items):
+		fin = np.isfinite(arr)
+		if np.any(fin):
+			v = arr[fin]
+			vmin = float(np.nanpercentile(v, 1.0))
+			vmax = float(np.nanpercentile(v, 99.0))
+			if vmax <= vmin:
+				vmax = vmin + 1e-6
+			im = ax.imshow(arr, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+			plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+		else:
+			im = ax.imshow(np.zeros_like(arr, dtype=np.float32), origin="lower", cmap=cmap)
+			plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+		ax.set_title(ttl)
+		ax.set_xlabel("x")
+		ax.set_ylabel("y")
+	fig.suptitle(f"Cube Fitting progress | pixels processed: {int(done_steps)}/{int(total_steps)}", y=0.98)
+	plt.tight_layout()
+	fig.savefig(out_png, dpi=170)
+	plt.close(fig)
+	info_path = os.path.splitext(out_png)[0] + ".json"
+	info = {
+		"title": f"Cube fitting parameter maps | pixels processed: {int(done_steps)}/{int(total_steps)}",
+		"done_steps": int(done_steps),
+		"total_steps": int(total_steps),
+	}
+	try:
+		with open(info_path, "w", encoding="utf-8") as f:
+			json.dump(info, f, ensure_ascii=False, indent=2)
+	except Exception:
+		pass
+
+
+def run_cube_fit_worker(cfg_path: str) -> int:
+	if fits is None:
+		print("FITS backend not available")
+		return 2
+	with open(cfg_path, "r", encoding="utf-8") as f:
+		cfg = json.load(f)
+
+	out_dir = str(cfg["out_dir"])
+	os.makedirs(out_dir, exist_ok=True)
+	obs_cube_path = str(cfg["obs_cube_path"])
+	signal_models_source = str(cfg["signal_models_source"])
+	noise_models_root = str(cfg["noise_models_root"])
+	filter_file = str(cfg["filter_file"])
+	target_freqs = [float(v) for v in cfg.get("target_freqs", [])]
+	case_mode = str(cfg.get("case_mode", "synthetic_only"))
+	fit_criterion = str(cfg.get("fit_criterion", "mae"))
+	global_weight_mode = str(cfg.get("global_weight_mode", "uniform"))
+	global_search_mode = str(cfg.get("global_search_mode", "per_roi"))
+	candidate_mode = str(cfg.get("candidate_mode", "random"))
+	n_candidates = int(cfg.get("n_candidates", 600))
+	ranges = dict(cfg.get("ranges", {}))
+	noise_scale = float(cfg.get("noise_scale", 1.0))
+	allow_nearest = bool(cfg.get("allow_nearest", True))
+	seed = int(cfg.get("seed", 42))
+	progress_every = int(max(1, int(cfg.get("progress_every", 40))))
+	obs_shift_enabled = bool(cfg.get("obs_shift_enabled", True))
+	obs_shift_mode = str(cfg.get("obs_shift_mode", "per_frequency"))
+	obs_shift_kms = float(cfg.get("obs_shift_kms", 0.0))
+	out_prefix = str(cfg.get("out_prefix", "CUBEFIT"))
+
+	if not os.path.isfile(obs_cube_path):
+		raise FileNotFoundError(f"Observational cube not found: {obs_cube_path}")
+
+	with fits.open(obs_cube_path, memmap=True) as hdul:
+		arr = np.asarray(hdul[0].data, dtype=np.float32)
+		ref_hdr = hdul[0].header.copy()
+	if arr.ndim == 4:
+		arr = arr[0]
+	if arr.ndim != 3:
+		raise RuntimeError(f"Unexpected observational cube shape: {arr.shape}")
+	nchan, ny, nx = int(arr.shape[0]), int(arr.shape[1]), int(arr.shape[2])
+	obs_freq = _build_freq_axis_from_header(ref_hdr, nchan)
+	if obs_shift_enabled:
+		if str(obs_shift_mode).strip().lower() == "spw_center":
+			obs_freq = _apply_velocity_shift_by_spw_center(obs_freq, float(obs_shift_kms))
+		else:
+			obs_freq = _apply_velocity_shift_to_frequency(obs_freq, float(obs_shift_kms))
+
+	X_shared = _sample_fit_candidates(
+		n_samples=int(n_candidates),
+		ranges=ranges,
+		seed=int(seed),
+		mode=str(candidate_mode),
+	)
+	noise_models_shared = None
+	if str(case_mode).strip().lower() == "synthetic_plus_noise":
+		entries = _list_noise_model_entries(noise_models_root)
+		nm = []
+		for e in entries:
+			try:
+				m, sy, c = _load_noisenn_from_entry(e)
+				m.eval()
+				nm.append((m, sy, c))
+			except Exception:
+				continue
+		if not nm:
+			raise RuntimeError("Case 2 requires valid noise models. None could be loaded.")
+		noise_models_shared = nm
+
+	pkg_cache_shared: Dict[str, object] = {}
+
+	map_logn = np.full((ny, nx), np.nan, dtype=np.float32)
+	map_tex = np.full((ny, nx), np.nan, dtype=np.float32)
+	map_velo = np.full((ny, nx), np.nan, dtype=np.float32)
+	map_fwhm = np.full((ny, nx), np.nan, dtype=np.float32)
+	map_obj = np.full((ny, nx), np.nan, dtype=np.float32)
+	map_mae = np.full((ny, nx), np.nan, dtype=np.float32)
+
+	valid_mask = np.any(np.isfinite(arr), axis=0)
+	pixel_order = _spiral_pixel_order_valid(valid_mask)
+	total_pixels = int(len(pixel_order))
+	if total_pixels <= 0:
+		raise RuntimeError("No valid observational pixels in cube")
+
+	progress_png = os.path.join(out_dir, f"{out_prefix}_INPROGRESS_MAP.png")
+	fit_count = 0
+	for p_done, (y, x) in enumerate(pixel_order, start=1):
+		y_obs = np.asarray(arr[:, y, x], dtype=np.float64)
+		if int(np.count_nonzero(np.isfinite(y_obs))) < 3:
+			continue
+		res = _run_roi_fitting(
+			signal_models_source=signal_models_source,
+			noise_models_root=noise_models_root,
+			filter_file=filter_file,
+			target_freqs=target_freqs,
+			obs_freq=np.asarray(obs_freq, dtype=np.float64),
+			obs_intensity=np.asarray(y_obs, dtype=np.float64),
+			case_mode=case_mode,
+			fit_criterion=fit_criterion,
+			global_weight_mode=global_weight_mode,
+			global_search_mode=global_search_mode,
+			candidate_mode=candidate_mode,
+			n_candidates=int(n_candidates),
+			ranges=ranges,
+			noise_scale=float(noise_scale),
+			allow_nearest=bool(allow_nearest),
+			seed=int(seed),
+			x_candidates_override=np.asarray(X_shared, dtype=np.float32),
+			noise_models_loaded_override=noise_models_shared,
+			pkg_cache_override=pkg_cache_shared,
+		)
+		if isinstance(res, dict) and bool(res.get("ok", False)):
+			bp = res.get("best_global_params", {}) if isinstance(res.get("best_global_params", {}), dict) else {}
+			map_logn[y, x] = float(bp.get("logN", np.nan))
+			map_tex[y, x] = float(bp.get("Tex", np.nan))
+			map_velo[y, x] = float(bp.get("Velocity", np.nan))
+			map_fwhm[y, x] = float(bp.get("FWHM", np.nan))
+			map_obj[y, x] = float(res.get("best_global_mean_objective", np.nan))
+			map_mae[y, x] = float(res.get("best_global_mean_MAE", np.nan))
+			fit_count += 1
+
+		if (p_done % progress_every) == 0 or p_done == total_pixels:
+			_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_INPROGRESS_LOGN.fits"), map_logn, ref_hdr, f"Checkpoint: {p_done}/{total_pixels}")
+			_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_INPROGRESS_TEX.fits"), map_tex, ref_hdr, f"Checkpoint: {p_done}/{total_pixels}")
+			_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_INPROGRESS_VELOCITY.fits"), map_velo, ref_hdr, f"Checkpoint: {p_done}/{total_pixels}")
+			_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_INPROGRESS_FWHM.fits"), map_fwhm, ref_hdr, f"Checkpoint: {p_done}/{total_pixels}")
+			_save_cubefit_progress_png(map_logn, map_tex, map_velo, map_fwhm, p_done, total_pixels, progress_png)
+
+	if fit_count <= 0:
+		raise RuntimeError("Cube fitting produced no valid fitted pixels")
+
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_LOGN.fits"), map_logn, ref_hdr, "Final cube fitting map")
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_TEX.fits"), map_tex, ref_hdr, "Final cube fitting map")
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_VELOCITY.fits"), map_velo, ref_hdr, "Final cube fitting map")
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_FWHM.fits"), map_fwhm, ref_hdr, "Final cube fitting map")
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_OBJECTIVE.fits"), map_obj, ref_hdr, "Final cube fitting objective map")
+	_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_MAE.fits"), map_mae, ref_hdr, "Final cube fitting MAE map")
+	print(f"[INFO] Cube fitting completed | valid fitted pixels: {fit_count}/{total_pixels}")
+	return 0
+
+
 def run_sim_worker(cfg_path: str) -> int:
 	with open(cfg_path, "r", encoding="utf-8") as f:
 		cfg = json.load(f)
@@ -2077,6 +2286,9 @@ def _run_roi_fitting(
 	noise_scale: float,
 	allow_nearest: bool,
 	seed: int,
+	x_candidates_override: Optional[np.ndarray] = None,
+	noise_models_loaded_override: Optional[List[tuple]] = None,
+	pkg_cache_override: Optional[Dict[str, object]] = None,
 ):
 	crit = str(fit_criterion).strip().lower()
 	if crit not in {"mae", "rmse", "chi_like", "r2"}:
@@ -2088,26 +2300,30 @@ def _run_roi_fitting(
 	if search_mode not in {"per_roi", "concatenated"}:
 		search_mode = "per_roi"
 
-	X = _sample_fit_candidates(
-		n_samples=int(n_candidates),
-		ranges=ranges,
-		seed=int(seed),
-		mode=str(candidate_mode),
-	)
+	if isinstance(x_candidates_override, np.ndarray) and x_candidates_override.ndim == 2 and x_candidates_override.shape[1] == 4:
+		X = np.asarray(x_candidates_override, dtype=np.float32)
+	else:
+		X = _sample_fit_candidates(
+			n_samples=int(n_candidates),
+			ranges=ranges,
+			seed=int(seed),
+			mode=str(candidate_mode),
+		)
 	n = int(X.shape[0])
-	pkg_cache: Dict[str, object] = {}
+	pkg_cache: Dict[str, object] = (pkg_cache_override if isinstance(pkg_cache_override, dict) else {})
 	warnings_out: List[str] = []
 
-	noise_models_loaded = []
+	noise_models_loaded = list(noise_models_loaded_override) if isinstance(noise_models_loaded_override, list) else []
 	if str(case_mode).strip().lower() == "synthetic_plus_noise":
-		entries = _list_noise_model_entries(noise_models_root)
-		for e in entries:
-			try:
-				m, sy, c = _load_noisenn_from_entry(e)
-				m.eval()
-				noise_models_loaded.append((m, sy, c))
-			except Exception:
-				continue
+		if not noise_models_loaded:
+			entries = _list_noise_model_entries(noise_models_root)
+			for e in entries:
+				try:
+					m, sy, c = _load_noisenn_from_entry(e)
+					m.eval()
+					noise_models_loaded.append((m, sy, c))
+				except Exception:
+					continue
 		if not noise_models_loaded:
 			return {
 				"ok": False,
@@ -2563,6 +2779,14 @@ def _ensure_state():
 		st.session_state.sim_result_path = ""
 	if "sim_last_result" not in st.session_state:
 		st.session_state.sim_last_result = None
+	if "cubefit_proc" not in st.session_state:
+		st.session_state.cubefit_proc = None
+	if "cubefit_log_path" not in st.session_state:
+		st.session_state.cubefit_log_path = ""
+	if "cubefit_cfg_path" not in st.session_state:
+		st.session_state.cubefit_cfg_path = ""
+	if "cubefit_log_handle" not in st.session_state:
+		st.session_state.cubefit_log_handle = None
 	if "drive_cache_dir" not in st.session_state:
 		st.session_state.drive_cache_dir = ""
 	if "drive_auto_paths" not in st.session_state:
@@ -2657,6 +2881,11 @@ def _is_sim_running() -> bool:
 	return proc is not None and proc.poll() is None
 
 
+def _is_cubefit_running() -> bool:
+	proc = st.session_state.get("cubefit_proc", None)
+	return proc is not None and proc.poll() is None
+
+
 def _stop_process():
 	proc = st.session_state.get("cube_proc", None)
 	if proc is not None and proc.poll() is None:
@@ -2711,6 +2940,34 @@ def _stop_sim_process():
 		except Exception:
 			pass
 	st.session_state.sim_cfg_path = ""
+
+
+def _stop_cubefit_process():
+	proc = st.session_state.get("cubefit_proc", None)
+	if proc is not None and proc.poll() is None:
+		try:
+			proc.terminate()
+			proc.wait(timeout=6)
+		except Exception:
+			try:
+				proc.kill()
+			except Exception:
+				pass
+	st.session_state.cubefit_proc = None
+	fh = st.session_state.get("cubefit_log_handle", None)
+	if fh is not None:
+		try:
+			fh.close()
+		except Exception:
+			pass
+	st.session_state.cubefit_log_handle = None
+	cfgp = st.session_state.get("cubefit_cfg_path", "")
+	if cfgp and os.path.isfile(cfgp):
+		try:
+			os.remove(cfgp)
+		except Exception:
+			pass
+	st.session_state.cubefit_cfg_path = ""
 
 
 def _load_uploaded_map_preview(upload_obj):
@@ -2821,6 +3078,7 @@ def _cleanup_generated_outputs_on_startup_once():
 	roots = [
 		str(DEFAULT_OUTPUT_DIR),
 		os.path.join(str(DEFAULT_OUTPUT_DIR), "cube2"),
+		os.path.join(str(DEFAULT_OUTPUT_DIR), "cube_fit"),
 	]
 	for root in roots:
 		if (not root) or (not os.path.isdir(root)):
@@ -2833,7 +3091,7 @@ def _cleanup_generated_outputs_on_startup_once():
 					is_cube_fits = str(name).startswith(f"{DEFAULT_OUT_PREFIX}_target") and ln.endswith(".fits")
 					is_progress_png = ln.endswith("_inprogress_map.png")
 					is_progress_json = ln.endswith("_inprogress_map.json")
-					is_run_log = (ln.startswith("cube_run_") or ln.startswith("cube2_run_")) and ln.endswith(".log")
+					is_run_log = (ln.startswith("cube_run_") or ln.startswith("cube2_run_") or ln.startswith("cubefit_run_")) and ln.endswith(".log")
 					if is_cube_fits or is_progress_png or is_progress_json or is_run_log:
 						os.remove(p)
 				elif os.path.isdir(p):
@@ -2863,6 +3121,24 @@ def _cleanup_generated_outputs_for_dir(out_dir: str, include_cube2_logs: bool = 
 			elif os.path.isdir(p):
 				if str(name).startswith("uploaded_maps_") or str(name).startswith("implicit_maps_"):
 					shutil.rmtree(p, ignore_errors=True)
+		except Exception:
+			pass
+
+
+def _cleanup_cubefit_outputs_for_dir(out_dir: str):
+	if (not out_dir) or (not os.path.isdir(out_dir)):
+		return
+	for name in os.listdir(out_dir):
+		p = os.path.join(out_dir, name)
+		ln = str(name).lower()
+		try:
+			if os.path.isfile(p):
+				is_cubefit_fits = ln.startswith("cubefit_") and ln.endswith(".fits")
+				is_progress_png = ln.endswith("_inprogress_map.png")
+				is_progress_json = ln.endswith("_inprogress_map.json")
+				is_run_log = ln.startswith("cubefit_run_") and ln.endswith(".log")
+				if is_cubefit_fits or is_progress_png or is_progress_json or is_run_log:
+					os.remove(p)
 		except Exception:
 			pass
 
@@ -3026,7 +3302,7 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 		st.caption("ROI selection mode for cube generation: exact overlap only (nearest disabled).")
 		noise_scale = st.number_input("Noise scale", min_value=0.0, value=float(DEFAULT_NOISE_SCALE), step=0.1, format="%.3f")
 
-	tab_cube, tab_cube2, tab_cube3, tab_fit = st.tabs(["Cube Generator", "Simulate Single Spectrum", "Simulate Single Synthetic Spectrum", "Fitting"])
+	tab_cube, tab_cube2, tab_cube3, tab_fit, tab_cube_fit = st.tabs(["Cube Generator", "Simulate Single Spectrum", "Simulate Single Synthetic Spectrum", "Fitting", "Cube Fitting"])
 
 	try:
 		syngen_path = _resolve_local_file("4.SYNGEN_Streamlit_v1.py")
@@ -4402,8 +4678,272 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 				with st.expander("Show fitting warnings"):
 					st.text("\n".join([str(w) for w in warns_fit]))
 
+	with tab_cube_fit:
+		st.subheader("Cube Fitting")
+		st.caption("Same fitting parameterization as 'Fitting', but applied pixel-by-pixel to an uploaded observational cube to produce LogN/Tex/Velocity/FWHM maps.")
+
+		guide_freqs_cfit_text = st.text_input(
+			"Guide frequencies (GHz; defines ROIs to fit in every pixel)",
+			value=_freqs_to_text([float(v) for v in target_freqs]),
+			key="p6_guide_freqs_cfit_input",
+		)
+		guide_freqs_cfit = _normalize_target_freqs_for_run(parse_freq_list(str(guide_freqs_cfit_text)))
+		if guide_freqs_cfit:
+			st.caption("Target frequencies used for cube fitting: " + _freqs_to_text(guide_freqs_cfit))
+
+		up_obs_cube_fit = st.file_uploader(
+			"Upload observational cube (.fits)",
+			type=["fits"],
+			key="p6_cubefit_upload_cube",
+		)
+		obs_cube_fit_path = _save_uploaded_file_to_temp(up_obs_cube_fit, "cubefit_obs_cube") if up_obs_cube_fit is not None else None
+
+		cubefit_out_dir = st.text_input("Output directory", value=os.path.join(DEFAULT_OUTPUT_DIR, "cube_fit"), key="p6_cubefit_out_dir")
+		cubefit_progress_every = st.number_input("Progress every N pixels", min_value=1, value=40, step=1, key="p6_cubefit_progress_every")
+
+		cubefit_case = st.radio(
+			"Fitting mode",
+			options=["Case 1: Synthetic only", "Case 2: Synthetic + noise"],
+			horizontal=True,
+			key="p6_cubefit_case_mode",
+		)
+		cubefit_case_mode = "synthetic_only" if "Case 1" in str(cubefit_case) else "synthetic_plus_noise"
+
+		cubefit_shift_enabled = st.checkbox("Apply observational frequency shift", value=True, key="p6_cubefit_shift_enabled")
+		cubefit_shift_mode = st.selectbox(
+			"Shift mode",
+			options=["per_frequency", "spw_center"],
+			index=0,
+			key="p6_cubefit_shift_mode",
+		)
+		cubefit_shift_kms = st.number_input(
+			"Observational shift (km/s)",
+			value=-98.0,
+			step=0.1,
+			format="%.4f",
+			key="p6_cubefit_shift_kms",
+		)
+
+		with st.expander("Fitting search ranges and speed settings", expanded=False):
+			cubefit_global_mode_ui = st.selectbox(
+				"Global fit strategy",
+				options=["Per-ROI aggregate", "Concatenated ROIs (single objective)"],
+				index=0,
+				key="p6_cubefit_global_mode",
+			)
+			cubefit_global_mode_map = {
+				"Per-ROI aggregate": "per_roi",
+				"Concatenated ROIs (single objective)": "concatenated",
+			}
+			cubefit_criterion_ui = st.selectbox(
+				"Fitting criterion",
+				options=["MAE", "RMSE", "CHI_like", "R2"],
+				index=2,
+				key="p6_cubefit_criterion",
+			)
+			cubefit_candidate_mode_ui = st.selectbox(
+				"Candidate generation",
+				options=["Smart ordered grid", "Random"],
+				index=1,
+				key="p6_cubefit_candidate_mode",
+			)
+			cubefit_candidate_mode_map = {
+				"Smart ordered grid": "ordered_grid",
+				"Random": "random",
+			}
+			cubefit_weight_mode_ui = st.selectbox(
+				"Global aggregation weighting",
+				options=[
+					"Uniform (all ROIs equal)",
+					"By overlap points per ROI",
+					"By ROI fit quality (criterion-aware)",
+				],
+				index=2,
+				key="p6_cubefit_weight_mode",
+			)
+			cubefit_weight_mode_map = {
+				"Uniform (all ROIs equal)": "uniform",
+				"By overlap points per ROI": "overlap_points",
+				"By ROI fit quality (criterion-aware)": "inverse_best_error",
+			}
+			cc1, cc2, cc3, cc4 = st.columns(4)
+			with cc1:
+				cubefit_logn_min = st.number_input("logN min", value=14.0, key="p6_cubefit_logn_min")
+				cubefit_logn_max = st.number_input("logN max", value=19.5, key="p6_cubefit_logn_max")
+			with cc2:
+				cubefit_tex_min = st.number_input("Tex min", value=100.0, key="p6_cubefit_tex_min")
+				cubefit_tex_max = st.number_input("Tex max", value=380.0, key="p6_cubefit_tex_max")
+			with cc3:
+				cubefit_velo_min = st.number_input("Velocity min", value=90.0, key="p6_cubefit_velo_min")
+				cubefit_velo_max = st.number_input("Velocity max", value=105.0, key="p6_cubefit_velo_max")
+			with cc4:
+				cubefit_fwhm_min = st.number_input("FWHM min", value=5.0, key="p6_cubefit_fwhm_min")
+				cubefit_fwhm_max = st.number_input("FWHM max", value=8.0, key="p6_cubefit_fwhm_max")
+
+			ccs1, ccs2 = st.columns(2)
+			with ccs1:
+				cubefit_n_candidates = st.number_input("Number of candidates", min_value=50, max_value=4000, value=600, step=50, key="p6_cubefit_n_candidates")
+			with ccs2:
+				cubefit_seed = st.number_input("Random seed", min_value=0, value=42, step=1, key="p6_cubefit_seed")
+
+		cbf1, cbf2 = st.columns(2)
+		with cbf1:
+			run_cubefit = st.button("Run cube fitting", type="primary", key="p6_run_cubefit_btn", disabled=_is_cubefit_running())
+		with cbf2:
+			stop_cubefit = st.button("Stop cube fitting", key="p6_stop_cubefit_btn", disabled=not _is_cubefit_running())
+
+		if run_cubefit:
+			if obs_cube_fit_path is None or (not os.path.isfile(str(obs_cube_fit_path))):
+				st.error("Upload a valid observational cube first.")
+			elif not guide_freqs_cfit:
+				st.error("Guide frequencies is empty. Add at least one frequency.")
+			elif not os.path.isfile(filter_file):
+				st.error(f"Filter file not found: {filter_file}")
+			elif (not signal_models_root) or ((not os.path.isfile(signal_models_root)) and (not os.path.isdir(signal_models_root))):
+				st.error("Signal models source invalid.")
+			elif (str(cubefit_case_mode).strip().lower() == "synthetic_plus_noise") and (not _is_valid_noise_source(noise_models_root)):
+				st.error("Noise models source invalid for Case 2.")
+			else:
+				try:
+					os.makedirs(cubefit_out_dir, exist_ok=True)
+					_cleanup_cubefit_outputs_for_dir(str(cubefit_out_dir))
+					ranges_cubefit = {
+						"logn_min": float(min(cubefit_logn_min, cubefit_logn_max)),
+						"logn_max": float(max(cubefit_logn_min, cubefit_logn_max)),
+						"tex_min": float(min(cubefit_tex_min, cubefit_tex_max)),
+						"tex_max": float(max(cubefit_tex_min, cubefit_tex_max)),
+						"velo_min": float(min(cubefit_velo_min, cubefit_velo_max)),
+						"velo_max": float(max(cubefit_velo_min, cubefit_velo_max)),
+						"fwhm_min": float(min(cubefit_fwhm_min, cubefit_fwhm_max)),
+						"fwhm_max": float(max(cubefit_fwhm_min, cubefit_fwhm_max)),
+					}
+					cfg_cfit = {
+						"out_dir": str(cubefit_out_dir),
+						"obs_cube_path": str(obs_cube_fit_path),
+						"signal_models_source": str(signal_models_root),
+						"noise_models_root": str(noise_models_root),
+						"filter_file": str(filter_file),
+						"target_freqs": [float(v) for v in guide_freqs_cfit],
+						"case_mode": str(cubefit_case_mode),
+						"fit_criterion": str(cubefit_criterion_ui).strip().lower(),
+						"global_weight_mode": str(cubefit_weight_mode_map.get(str(cubefit_weight_mode_ui), "uniform")),
+						"global_search_mode": str(cubefit_global_mode_map.get(str(cubefit_global_mode_ui), "per_roi")),
+						"candidate_mode": str(cubefit_candidate_mode_map.get(str(cubefit_candidate_mode_ui), "random")),
+						"n_candidates": int(cubefit_n_candidates),
+						"ranges": ranges_cubefit,
+						"noise_scale": float(noise_scale),
+						"allow_nearest": bool(allow_nearest),
+						"seed": int(cubefit_seed),
+						"progress_every": int(cubefit_progress_every),
+						"obs_shift_enabled": bool(cubefit_shift_enabled),
+						"obs_shift_mode": str(cubefit_shift_mode),
+						"obs_shift_kms": float(cubefit_shift_kms),
+						"out_prefix": "CUBEFIT",
+					}
+					fdc, cfg_cfit_path = tempfile.mkstemp(prefix="predobs6_cubefit_cfg_", suffix=".json", dir=tempfile.gettempdir())
+					os.close(fdc)
+					with open(cfg_cfit_path, "w", encoding="utf-8") as f:
+						json.dump(cfg_cfit, f, ensure_ascii=False, indent=2)
+					log_cfit_path = os.path.join(cubefit_out_dir, f"cubefit_run_{time.strftime('%Y%m%d_%H%M%S')}.log")
+					log_cfit_fh = open(log_cfit_path, "a", encoding="utf-8", buffering=1)
+					proc_cfit = subprocess.Popen(
+						[sys.executable, str(Path(__file__).resolve()), "--cube-fit-worker", cfg_cfit_path],
+						cwd=str(_project_dir()),
+						stdout=log_cfit_fh,
+						stderr=subprocess.STDOUT,
+						text=True,
+					)
+					st.session_state.cubefit_proc = proc_cfit
+					st.session_state.cubefit_log_path = log_cfit_path
+					st.session_state.cubefit_cfg_path = cfg_cfit_path
+					st.session_state.cubefit_log_handle = log_cfit_fh
+					st.success("Cube fitting started.")
+				except Exception as e:
+					st.error(f"Could not start cube fitting: {e}")
+
+		if stop_cubefit:
+			_stop_cubefit_process()
+			st.warning("Cube fitting stopped by user.")
+
+		if _is_cubefit_running():
+			st.info("Cube fitting status: running")
+		else:
+			proc_cf = st.session_state.get("cubefit_proc", None)
+			if proc_cf is not None:
+				code_cf = proc_cf.poll()
+				if code_cf == 0:
+					st.success("Cube fitting status: finished successfully")
+				elif code_cf is not None:
+					st.error(f"Cube fitting status: finished with code {code_cf}")
+					log_tail_cf = _read_log_tail(str(st.session_state.get("cubefit_log_path", "")), n_lines=120)
+					if log_tail_cf:
+						with st.expander("Show last cube fitting log lines"):
+							st.text(log_tail_cf)
+				_stop_cubefit_process()
+			else:
+				st.caption("Cube fitting status: idle")
+
+		progress_png_cf = _find_latest_progress_png(str(cubefit_out_dir))
+		if progress_png_cf:
+			st.markdown("**Cube fitting progress**")
+			progress_info_cf = _read_progress_info(progress_png_cf)
+			if isinstance(progress_info_cf, dict):
+				done_steps = int(progress_info_cf.get("done_steps", 0))
+				total_steps = int(max(1, progress_info_cf.get("total_steps", 1)))
+				pct = 100.0 * float(done_steps) / float(total_steps)
+				st.success(f"**Pixels processed:** {done_steps}/{total_steps} ({pct:.1f}%)")
+			img_bytes_cf = _read_progress_png_stable_bytes(progress_png_cf)
+			if img_bytes_cf is not None:
+				st.image(img_bytes_cf, caption=os.path.basename(progress_png_cf), width=520)
+
+		if not _is_cubefit_running():
+			map_files = {
+				"logN": os.path.join(str(cubefit_out_dir), "CUBEFIT_LOGN.fits"),
+				"Tex": os.path.join(str(cubefit_out_dir), "CUBEFIT_TEX.fits"),
+				"Velocity": os.path.join(str(cubefit_out_dir), "CUBEFIT_VELOCITY.fits"),
+				"FWHM": os.path.join(str(cubefit_out_dir), "CUBEFIT_FWHM.fits"),
+			}
+			available_maps = {k: v for k, v in map_files.items() if os.path.isfile(v)}
+			if available_maps:
+				st.markdown("**Cube fitting parameter maps (final)**")
+				mc1, mc2 = st.columns(2)
+				cols_map = [mc1, mc2]
+				for i_m, (mk, mp) in enumerate(available_maps.items()):
+					with cols_map[i_m % 2]:
+						try:
+							arr_m = np.asarray(fits.getdata(mp), dtype=np.float32)
+							if arr_m.ndim == 3:
+								arr_m = arr_m[0]
+							_show_fits_preview(mk, arr_m)
+						except Exception:
+							st.caption(f"Could not render preview for {mk}")
+						try:
+							with open(mp, "rb") as f_mp:
+								st.download_button(
+									f"Download {mk} map (.fits)",
+									data=f_mp.read(),
+									file_name=os.path.basename(mp),
+									mime="application/fits",
+									key=f"p6_cubefit_download_{mk}",
+								)
+						except Exception:
+							pass
+
+		if _is_cubefit_running():
+			st.caption("Auto-updating every 5 seconds...")
+			time.sleep(5)
+			st.rerun()
+
 
 def _worker_entry_if_needed() -> bool:
+	if "--cube-fit-worker" in sys.argv:
+		idx = sys.argv.index("--cube-fit-worker")
+		if idx + 1 >= len(sys.argv):
+			print("Missing cube-fit config path")
+			sys.exit(2)
+		cfg_path = sys.argv[idx + 1]
+		code = run_cube_fit_worker(cfg_path)
+		sys.exit(int(code))
 	if "--cube-worker" not in sys.argv:
 		if "--sim-worker" not in sys.argv:
 			return False
