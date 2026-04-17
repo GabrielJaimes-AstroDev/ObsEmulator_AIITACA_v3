@@ -1370,64 +1370,6 @@ def _save_cubefit_progress_png(
 		pass
 
 
-def _neighbor_seed_from_maps(
-	map_logn: np.ndarray,
-	map_tex: np.ndarray,
-	map_velo: np.ndarray,
-	map_fwhm: np.ndarray,
-	y: int,
-	x: int,
-	radius: int = 2,
-	min_neighbors: int = 3,
-) -> Optional[np.ndarray]:
-	r = int(max(1, radius))
-	ny, nx = int(map_logn.shape[0]), int(map_logn.shape[1])
-	y0, y1 = max(0, int(y) - r), min(ny, int(y) + r + 1)
-	x0, x1 = max(0, int(x) - r), min(nx, int(x) + r + 1)
-	l = np.asarray(map_logn[y0:y1, x0:x1], dtype=np.float64)
-	t = np.asarray(map_tex[y0:y1, x0:x1], dtype=np.float64)
-	v = np.asarray(map_velo[y0:y1, x0:x1], dtype=np.float64)
-	f = np.asarray(map_fwhm[y0:y1, x0:x1], dtype=np.float64)
-	m = np.isfinite(l) & np.isfinite(t) & np.isfinite(v) & np.isfinite(f)
-	if int(np.count_nonzero(m)) < int(max(1, min_neighbors)):
-		return None
-	return np.asarray([
-		float(np.nanmedian(l[m])),
-		float(np.nanmedian(t[m])),
-		float(np.nanmedian(v[m])),
-		float(np.nanmedian(f[m])),
-	], dtype=np.float32)
-
-
-def _build_local_ranges_around_seed(global_ranges: dict, seed_params: np.ndarray, shrink_factor: float = 0.12) -> dict:
-	s = np.asarray(seed_params, dtype=np.float64).reshape(-1)
-	if s.size != 4:
-		return dict(global_ranges)
-	sh = float(np.clip(float(shrink_factor), 0.02, 0.8))
-	keys = [
-		("logn_min", "logn_max", 0),
-		("tex_min", "tex_max", 1),
-		("velo_min", "velo_max", 2),
-		("fwhm_min", "fwhm_max", 3),
-	]
-	out = {}
-	for kmin, kmax, idx in keys:
-		gmin = float(global_ranges[kmin])
-		gmax = float(global_ranges[kmax])
-		if gmax < gmin:
-			gmin, gmax = gmax, gmin
-		span = float(max(1e-9, gmax - gmin))
-		half = 0.5 * sh * span
-		c = float(np.clip(float(s[idx]), gmin, gmax))
-		lo = float(max(gmin, c - half))
-		hi = float(min(gmax, c + half))
-		if hi <= lo:
-			lo, hi = gmin, gmax
-		out[kmin] = float(lo)
-		out[kmax] = float(hi)
-	return out
-
-
 def run_cube_fit_worker(cfg_path: str) -> int:
 	if fits is None:
 		print("FITS backend not available")
@@ -1454,12 +1396,6 @@ def run_cube_fit_worker(cfg_path: str) -> int:
 	seed = int(cfg.get("seed", 42))
 	progress_every = int(max(1, int(cfg.get("progress_every", 40))))
 	spatial_stride = int(max(1, int(cfg.get("spatial_stride", 1))))
-	bootstrap_pixels = int(max(1, int(cfg.get("bootstrap_pixels", 600))))
-	full_refresh_every = int(max(20, int(cfg.get("full_refresh_every", 300))))
-	full_search_candidates = int(max(50, int(cfg.get("full_search_candidates", n_candidates))))
-	local_search_candidates = int(max(20, int(cfg.get("local_search_candidates", 100))))
-	local_shrink_factor = float(np.clip(float(cfg.get("local_shrink_factor", 0.12)), 0.02, 0.8))
-	local_neighbor_radius = int(max(1, int(cfg.get("local_neighbor_radius", 2))))
 	obs_shift_enabled = bool(cfg.get("obs_shift_enabled", True))
 	obs_shift_mode = str(cfg.get("obs_shift_mode", "per_frequency"))
 	obs_shift_kms = float(cfg.get("obs_shift_kms", 0.0))
@@ -1483,8 +1419,8 @@ def run_cube_fit_worker(cfg_path: str) -> int:
 		else:
 			obs_freq = _apply_velocity_shift_to_frequency(obs_freq, float(obs_shift_kms))
 
-	X_full = _sample_fit_candidates(
-		n_samples=int(full_search_candidates),
+	X_shared = _sample_fit_candidates(
+		n_samples=int(n_candidates),
 		ranges=ranges,
 		seed=int(seed),
 		mode=str(candidate_mode),
@@ -1522,51 +1458,11 @@ def run_cube_fit_worker(cfg_path: str) -> int:
 		raise RuntimeError("No valid observational pixels in cube")
 
 	progress_png = os.path.join(out_dir, f"{out_prefix}_INPROGRESS_MAP.png")
-	print(
-		f"[INFO] Cube fit adaptive strategy | bootstrap_pixels={bootstrap_pixels}, "
-		f"full_search_candidates={full_search_candidates}, local_search_candidates={local_search_candidates}, "
-		f"full_refresh_every={full_refresh_every}, local_shrink_factor={local_shrink_factor}, "
-		f"local_neighbor_radius={local_neighbor_radius}, spatial_stride={spatial_stride}"
-	)
 	fit_count = 0
-	last_good_seed = None
 	for p_done, (y, x) in enumerate(pixel_order, start=1):
 		y_obs = np.asarray(arr[:, y, x], dtype=np.float64)
 		if int(np.count_nonzero(np.isfinite(y_obs))) < 3:
 			continue
-
-		seed_from_neighbors = _neighbor_seed_from_maps(
-			map_logn=map_logn,
-			map_tex=map_tex,
-			map_velo=map_velo,
-			map_fwhm=map_fwhm,
-			y=int(y),
-			x=int(x),
-			radius=int(local_neighbor_radius),
-			min_neighbors=3,
-		)
-		if seed_from_neighbors is None and isinstance(last_good_seed, np.ndarray):
-			seed_from_neighbors = np.asarray(last_good_seed, dtype=np.float32)
-
-		use_full = (
-			(int(p_done) <= int(bootstrap_pixels))
-			or (int(p_done) % int(full_refresh_every) == 0)
-			or (seed_from_neighbors is None)
-		)
-		if use_full:
-			X_use = np.asarray(X_full, dtype=np.float32)
-		else:
-			local_ranges = _build_local_ranges_around_seed(
-				global_ranges=ranges,
-				seed_params=np.asarray(seed_from_neighbors, dtype=np.float32),
-				shrink_factor=float(local_shrink_factor),
-			)
-			X_use = _sample_fit_candidates(
-				n_samples=int(local_search_candidates),
-				ranges=local_ranges,
-				seed=int(seed + p_done),
-				mode="random",
-			)
 		res = _run_roi_fitting(
 			signal_models_source=signal_models_source,
 			noise_models_root=noise_models_root,
@@ -1579,12 +1475,12 @@ def run_cube_fit_worker(cfg_path: str) -> int:
 			global_weight_mode=global_weight_mode,
 			global_search_mode=global_search_mode,
 			candidate_mode=candidate_mode,
-			n_candidates=int(X_use.shape[0]),
+			n_candidates=int(n_candidates),
 			ranges=ranges,
 			noise_scale=float(noise_scale),
 			allow_nearest=bool(allow_nearest),
 			seed=int(seed),
-			x_candidates_override=np.asarray(X_use, dtype=np.float32),
+			x_candidates_override=np.asarray(X_shared, dtype=np.float32),
 			noise_models_loaded_override=noise_models_shared,
 			pkg_cache_override=pkg_cache_shared,
 		)
@@ -1597,8 +1493,6 @@ def run_cube_fit_worker(cfg_path: str) -> int:
 			map_obj[y, x] = float(res.get("best_global_mean_objective", np.nan))
 			map_mae[y, x] = float(res.get("best_global_mean_MAE", np.nan))
 			fit_count += 1
-			if np.all(np.isfinite([map_logn[y, x], map_tex[y, x], map_velo[y, x], map_fwhm[y, x]])):
-				last_good_seed = np.asarray([map_logn[y, x], map_tex[y, x], map_velo[y, x], map_fwhm[y, x]], dtype=np.float32)
 
 		if (p_done % progress_every) == 0 or p_done == total_pixels:
 			_write_map_fits_2d(os.path.join(out_dir, f"{out_prefix}_INPROGRESS_LOGN.fits"), map_logn, ref_hdr, f"Checkpoint: {p_done}/{total_pixels}")
@@ -4896,20 +4790,6 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 			with ccs2:
 				cubefit_seed = st.number_input("Random seed", min_value=0, value=42, step=1, key="p6_cubefit_seed")
 
-		with st.expander("Adaptive speed-up (center bootstrap + local seeded search)", expanded=True):
-			ca1, ca2, ca3 = st.columns(3)
-			with ca1:
-				cubefit_bootstrap_pixels = st.number_input("Bootstrap pixels from center", min_value=50, max_value=5000, value=600, step=50, key="p6_cubefit_bootstrap_pixels")
-			with ca2:
-				cubefit_local_candidates = st.number_input("Local candidates", min_value=20, max_value=1000, value=100, step=10, key="p6_cubefit_local_candidates")
-			with ca3:
-				cubefit_full_refresh_every = st.number_input("Periodic full refresh every N pixels", min_value=20, max_value=5000, value=300, step=20, key="p6_cubefit_full_refresh_every")
-			ca4, ca5 = st.columns(2)
-			with ca4:
-				cubefit_local_shrink = st.number_input("Local range shrink factor", min_value=0.02, max_value=0.80, value=0.12, step=0.01, format="%.2f", key="p6_cubefit_local_shrink")
-			with ca5:
-				cubefit_neighbor_radius = st.number_input("Neighbor radius (pixels)", min_value=1, max_value=10, value=2, step=1, key="p6_cubefit_neighbor_radius")
-
 		cbf1, cbf2 = st.columns(2)
 		with cbf1:
 			run_cubefit = st.button("Run cube fitting", type="primary", key="p6_run_cubefit_btn", disabled=_is_cubefit_running())
@@ -4954,12 +4834,6 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						"global_search_mode": str(cubefit_global_mode_map.get(str(cubefit_global_mode_ui), "per_roi")),
 						"candidate_mode": str(cubefit_candidate_mode_map.get(str(cubefit_candidate_mode_ui), "random")),
 						"n_candidates": int(cubefit_n_candidates),
-						"full_search_candidates": int(cubefit_n_candidates),
-						"local_search_candidates": int(cubefit_local_candidates),
-						"bootstrap_pixels": int(cubefit_bootstrap_pixels),
-						"full_refresh_every": int(cubefit_full_refresh_every),
-						"local_shrink_factor": float(cubefit_local_shrink),
-						"local_neighbor_radius": int(cubefit_neighbor_radius),
 						"ranges": ranges_cubefit,
 						"noise_scale": float(noise_scale),
 						"allow_nearest": bool(allow_nearest),
