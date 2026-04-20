@@ -2272,6 +2272,69 @@ def _criterion_aware_roi_quality_weight(
 	return float(np.clip(1.0 / max(err, 1e-12), 1e-6, 1e6))
 
 
+def _format_freqs_short(freqs: List[float], max_show: int = 4) -> str:
+	v = [float(x) for x in (freqs or []) if np.isfinite(float(x))]
+	if not v:
+		return ""
+	v = sorted(v)
+	ms = int(max(1, max_show))
+	if len(v) <= ms:
+		return ", ".join([f"{float(x):.6f}" for x in v])
+	head = ", ".join([f"{float(x):.6f}" for x in v[:ms]])
+	return f"{head}, ... (+{int(len(v) - ms)} more)"
+
+
+def _group_target_freqs_by_signal_roi(
+	signal_models_source: str,
+	filter_file: str,
+	target_freqs: List[float],
+	allow_nearest: bool,
+) -> List[dict]:
+	uniq = _normalize_target_freqs_for_run([float(v) for v in (target_freqs or [])])
+	out: List[dict] = []
+	key_to_idx: Dict[tuple, int] = {}
+
+	for tf in uniq:
+		grp_key = ("freq", round(float(tf), 9))
+		roi_lo = None
+		roi_hi = None
+		n_ch = None
+		try:
+			_, _, roi_freq = build_signal_index_for_roi(
+				signal_source=signal_models_source,
+				filter_file=filter_file,
+				target_frequency_ghz=float(tf),
+				pred_mode=DEFAULT_PRED_MODE,
+				selected_model_name=DEFAULT_SELECTED_MODEL_NAME,
+				allow_nearest=bool(allow_nearest),
+			)
+			rf = np.asarray(roi_freq, dtype=np.float64).reshape(-1)
+			if rf.size > 0 and np.any(np.isfinite(rf)):
+				roi_lo = float(np.nanmin(rf))
+				roi_hi = float(np.nanmax(rf))
+				n_ch = int(rf.size)
+				grp_key = ("roi", int(n_ch), round(float(roi_lo), 9), round(float(roi_hi), 9))
+		except Exception:
+			pass
+
+		if grp_key not in key_to_idx:
+			key_to_idx[grp_key] = int(len(out))
+			out.append({
+				"representative_target_freq_ghz": float(tf),
+				"guide_freqs_ghz": [float(tf)],
+				"roi_f_min_ghz": (None if roi_lo is None else float(roi_lo)),
+				"roi_f_max_ghz": (None if roi_hi is None else float(roi_hi)),
+				"n_roi_channels": (None if n_ch is None else int(n_ch)),
+			})
+		else:
+			out[int(key_to_idx[grp_key])]["guide_freqs_ghz"].append(float(tf))
+
+	for g in out:
+		g["guide_freqs_ghz"] = sorted([float(x) for x in g.get("guide_freqs_ghz", [])])
+
+	return out
+
+
 def _run_roi_fitting(
 	signal_models_source: str,
 	noise_models_root: str,
@@ -2315,6 +2378,28 @@ def _run_roi_fitting(
 	n = int(X.shape[0])
 	pkg_cache: Dict[str, object] = (pkg_cache_override if isinstance(pkg_cache_override, dict) else {})
 	warnings_out: List[str] = []
+	target_groups = _group_target_freqs_by_signal_roi(
+		signal_models_source=str(signal_models_source),
+		filter_file=str(filter_file),
+		target_freqs=[float(v) for v in (target_freqs or [])],
+		allow_nearest=bool(allow_nearest),
+	)
+	target_freqs_eval = [float(g.get("representative_target_freq_ghz", np.nan)) for g in target_groups]
+	target_meta_by_rep: Dict[float, dict] = {}
+	for g in target_groups:
+		target_meta_by_rep[float(g.get("representative_target_freq_ghz", np.nan))] = {
+			"guide_freqs_ghz": [float(v) for v in g.get("guide_freqs_ghz", [])],
+			"guide_freqs_label": _format_freqs_short([float(v) for v in g.get("guide_freqs_ghz", [])]),
+			"n_guide_freqs_in_roi": int(len(g.get("guide_freqs_ghz", []))),
+			"roi_f_min_ghz": g.get("roi_f_min_ghz", None),
+			"roi_f_max_ghz": g.get("roi_f_max_ghz", None),
+		}
+	if not target_freqs_eval:
+		return {
+			"ok": False,
+			"warnings": ["Guide frequencies did not produce any valid ROI group."],
+			"message": "No ROI could be built from Guide frequencies.",
+		}
 
 	noise_models_loaded = list(noise_models_loaded_override) if isinstance(noise_models_loaded_override, list) else []
 	if str(case_mode).strip().lower() == "synthetic_plus_noise":
@@ -2348,7 +2433,7 @@ def _run_roi_fitting(
 	concat_sq_err = np.zeros((n,), dtype=np.float64)
 	concat_chi_term = np.zeros((n,), dtype=np.float64)
 
-	for tf in [float(v) for v in (target_freqs or [])]:
+	for tf in target_freqs_eval:
 		tag = f"{float(tf):.6f}"
 		try:
 			mae_all = np.full((n,), np.inf, dtype=np.float64)
@@ -2503,6 +2588,11 @@ def _run_roi_fitting(
 
 			per_roi_rows.append({
 				"target_freq_ghz": float(tf),
+				"guide_freqs_ghz": list(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_ghz", [float(tf)])),
+				"guide_freqs_label": str(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_label", f"{float(tf):.6f}")),
+				"n_guide_freqs_in_roi": int(target_meta_by_rep.get(float(tf), {}).get("n_guide_freqs_in_roi", 1)),
+				"roi_f_min_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", None) is not None else np.nan,
+				"roi_f_max_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", None) is not None else np.nan,
 				"n_channels": int(roi_freq_eval.size),
 				"n_overlap_points": int(roi_n_overlap),
 				"best_MAE": float(mae[best_i]),
@@ -2533,6 +2623,11 @@ def _run_roi_fitting(
 
 			best_plot_payload.append({
 				"target_freq_ghz": float(tf),
+				"guide_freqs_ghz": list(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_ghz", [float(tf)])),
+				"guide_freqs_label": str(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_label", f"{float(tf):.6f}")),
+				"n_guide_freqs_in_roi": int(target_meta_by_rep.get(float(tf), {}).get("n_guide_freqs_in_roi", 1)),
+				"roi_f_min_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", None) is not None else np.nan,
+				"roi_f_max_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", None) is not None else np.nan,
 				"freq": ds_freq,
 				"obs_interp": ds_arrays[0],
 				"best_synthetic": ds_arrays[1],
@@ -2598,7 +2693,7 @@ def _run_roi_fitting(
 	global_overlay = []
 	global_per_roi_rows: List[dict] = []
 	global_plot_payload: List[dict] = []
-	for tf in [float(v) for v in (target_freqs or [])]:
+	for tf in target_freqs_eval:
 		tag = f"{float(tf):.6f}"
 		try:
 			roi_freq_g, y_syn_g, err_g = _predict_synthetic_batch_single_target(
@@ -2677,6 +2772,11 @@ def _run_roi_fitting(
 
 				global_per_roi_rows.append({
 					"target_freq_ghz": float(tf),
+					"guide_freqs_ghz": list(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_ghz", [float(tf)])),
+					"guide_freqs_label": str(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_label", f"{float(tf):.6f}")),
+					"n_guide_freqs_in_roi": int(target_meta_by_rep.get(float(tf), {}).get("n_guide_freqs_in_roi", 1)),
+					"roi_f_min_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", None) is not None else np.nan,
+					"roi_f_max_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", None) is not None else np.nan,
 					"n_channels": int(np.asarray(roi_freq_g, dtype=np.float64).size),
 					"n_overlap_points": int(np.count_nonzero(vg)),
 					"best_MAE": float(mae_g),
@@ -2696,6 +2796,11 @@ def _run_roi_fitting(
 
 				global_plot_payload.append({
 					"target_freq_ghz": float(tf),
+					"guide_freqs_ghz": list(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_ghz", [float(tf)])),
+					"guide_freqs_label": str(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_label", f"{float(tf):.6f}")),
+					"n_guide_freqs_in_roi": int(target_meta_by_rep.get(float(tf), {}).get("n_guide_freqs_in_roi", 1)),
+					"roi_f_min_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", None) is not None else np.nan,
+					"roi_f_max_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", None) is not None else np.nan,
 					"freq": ds_fg,
 					"obs_interp": ds_g[0],
 					"best_synthetic": ds_g[1],
@@ -2706,6 +2811,11 @@ def _run_roi_fitting(
 
 			global_overlay.append({
 				"target_freq_ghz": float(tf),
+				"guide_freqs_ghz": list(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_ghz", [float(tf)])),
+				"guide_freqs_label": str(target_meta_by_rep.get(float(tf), {}).get("guide_freqs_label", f"{float(tf):.6f}")),
+				"n_guide_freqs_in_roi": int(target_meta_by_rep.get(float(tf), {}).get("n_guide_freqs_in_roi", 1)),
+				"roi_f_min_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_min_ghz", None) is not None else np.nan,
+				"roi_f_max_ghz": float(target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", np.nan)) if target_meta_by_rep.get(float(tf), {}).get("roi_f_max_ghz", None) is not None else np.nan,
 				"freq": ds_fg,
 				"obs_interp": ds_g[0],
 				"best_global_synthetic": ds_g[1],
@@ -2728,6 +2838,8 @@ def _run_roi_fitting(
 		"ok": True,
 		"case_mode": str(case_mode),
 		"global_search_mode": str(search_mode),
+		"n_guide_freqs_input": int(len([float(v) for v in (target_freqs or [])])),
+		"n_unique_rois_requested": int(len(target_groups)),
 		"n_candidates": int(n),
 		"best_global_index": int(best_global_idx),
 		"best_global_params": {
@@ -4579,6 +4691,8 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 					f"Mode: {fit_result.get('case_mode', '')} | "
 					f"Global strategy: {fit_result.get('global_search_mode', 'per_roi')} | "
 					f"Candidates: {int(fit_result.get('n_candidates', 0))} | "
+					f"Guide freqs input: {int(fit_result.get('n_guide_freqs_input', 0))} | "
+					f"Unique ROIs from guide freqs: {int(fit_result.get('n_unique_rois_requested', 0))} | "
 					f"ROIs fitted: {int(fit_result.get('n_rois_fitted', 0))} | "
 					f"Sampling: {fit_result.get('candidate_mode', 'ordered_grid')} | "
 					f"Weighting: {fit_result.get('global_weight_mode', 'uniform')}"
@@ -4660,7 +4774,12 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						yn = pf.get("best_noise", None)
 						yp = np.asarray(pf.get("best_pred", []), dtype=np.float64)
 						with cols_fit[i_pf % n_cols_fit]:
-							st.caption(f"target {float(pf.get('target_freq_ghz', np.nan)):.6f} GHz")
+							gf_label = str(pf.get("guide_freqs_label", "")).strip()
+							n_gf = int(pf.get("n_guide_freqs_in_roi", 1))
+							if n_gf > 1 and gf_label:
+								st.caption(f"ROI predicted once for guide freqs: {gf_label} GHz")
+							else:
+								st.caption(f"target {float(pf.get('target_freq_ghz', np.nan)):.6f} GHz")
 							fig_fit = go.Figure()
 							fig_fit.add_trace(go.Scatter(x=fpf, y=yobs, mode="lines", name="Observed (interp)", line=dict(color="green")))
 							fig_fit.add_trace(go.Scatter(x=fpf, y=ys, mode="lines", name="Best synthetic", line=dict(dash="dash")))
