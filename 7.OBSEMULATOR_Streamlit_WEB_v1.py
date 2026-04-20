@@ -2290,7 +2290,18 @@ def _group_target_freqs_by_signal_roi(
 	target_freqs: List[float],
 	allow_nearest: bool,
 ) -> List[dict]:
-	uniq = _normalize_target_freqs_for_run([float(v) for v in (target_freqs or [])])
+	raw = [float(v) for v in (target_freqs or []) if np.isfinite(float(v))]
+	# Last occurrence wins: keep unique frequencies preserving the order of their
+	# latest appearance in the input list.
+	seen = set()
+	uniq_rev: List[float] = []
+	for tf in reversed(raw):
+		k = round(float(tf), 12)
+		if k in seen:
+			continue
+		seen.add(k)
+		uniq_rev.append(float(tf))
+	uniq = list(reversed(uniq_rev))
 	out: List[dict] = []
 	key_to_idx: Dict[tuple, int] = {}
 
@@ -2327,7 +2338,15 @@ def _group_target_freqs_by_signal_roi(
 				"n_roi_channels": (None if n_ch is None else int(n_ch)),
 			})
 		else:
-			out[int(key_to_idx[grp_key])]["guide_freqs_ghz"].append(float(tf))
+			ix = int(key_to_idx[grp_key])
+			out[ix]["guide_freqs_ghz"].append(float(tf))
+			# Use the most recently added guide frequency as representative.
+			out[ix]["representative_target_freq_ghz"] = float(tf)
+			if roi_lo is not None and roi_hi is not None:
+				out[ix]["roi_f_min_ghz"] = float(roi_lo)
+				out[ix]["roi_f_max_ghz"] = float(roi_hi)
+			if n_ch is not None:
+				out[ix]["n_roi_channels"] = int(n_ch)
 
 	for g in out:
 		g["guide_freqs_ghz"] = sorted([float(x) for x in g.get("guide_freqs_ghz", [])])
