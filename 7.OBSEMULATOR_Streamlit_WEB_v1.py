@@ -4774,12 +4774,22 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 						yn = pf.get("best_noise", None)
 						yp = np.asarray(pf.get("best_pred", []), dtype=np.float64)
 						with cols_fit[i_pf % n_cols_fit]:
+							gf_list = [float(v) for v in pf.get("guide_freqs_ghz", [])]
 							gf_label = str(pf.get("guide_freqs_label", "")).strip()
-							n_gf = int(pf.get("n_guide_freqs_in_roi", 1))
-							if n_gf > 1 and gf_label:
-								st.caption(f"ROI predicted once for guide freqs: {gf_label} GHz")
+							if (not gf_label) and gf_list:
+								gf_label = _format_freqs_short(gf_list)
+							n_gf = int(pf.get("n_guide_freqs_in_roi", max(1, len(gf_list))))
+							roi_lo = pf.get("roi_f_min_ghz", np.nan)
+							roi_hi = pf.get("roi_f_max_ghz", np.nan)
+							if np.isfinite(float(roi_lo)) and np.isfinite(float(roi_hi)):
+								st.caption(
+									f"ROI [{float(roi_lo):.6f}, {float(roi_hi):.6f}] GHz | "
+									f"Guide freqs in ROI ({int(n_gf)}): {gf_label if gf_label else f'{float(pf.get('target_freq_ghz', np.nan)):.6f}'} GHz"
+								)
 							else:
-								st.caption(f"target {float(pf.get('target_freq_ghz', np.nan)):.6f} GHz")
+								st.caption(
+									f"Guide freqs in ROI ({int(n_gf)}): {gf_label if gf_label else f'{float(pf.get('target_freq_ghz', np.nan)):.6f}'} GHz"
+								)
 							fig_fit = go.Figure()
 							fig_fit.add_trace(go.Scatter(x=fpf, y=yobs, mode="lines", name="Observed (interp)", line=dict(color="green")))
 							fig_fit.add_trace(go.Scatter(x=fpf, y=ys, mode="lines", name="Best synthetic", line=dict(dash="dash")))
@@ -4796,6 +4806,21 @@ A remarkable upsurge in the complexity of molecules identified in the interstell
 							st.plotly_chart(fig_fit, width="stretch", key=f"p6_fit_plot_{i_pf}")
 
 			warns_fit = fit_result.get("warnings", [])
+			rows_fit_for_map = fit_result.get("per_roi", [])
+			if isinstance(rows_fit_for_map, list) and rows_fit_for_map:
+				with st.expander("Guide frequencies mapped to fitted ROIs"):
+					for rr in rows_fit_for_map:
+						gfl = str(rr.get("guide_freqs_label", "")).strip()
+						if not gfl:
+							gfl = f"{float(rr.get('target_freq_ghz', np.nan)):.6f}"
+						lo = rr.get("roi_f_min_ghz", np.nan)
+						hi = rr.get("roi_f_max_ghz", np.nan)
+						if np.isfinite(float(lo)) and np.isfinite(float(hi)):
+							st.write(
+								f"ROI [{float(lo):.6f}, {float(hi):.6f}] GHz <- Guide freqs: {gfl} GHz"
+							)
+						else:
+							st.write(f"Guide freqs: {gfl} GHz")
 			if isinstance(warns_fit, list) and warns_fit:
 				with st.expander("Show fitting warnings"):
 					st.text("\n".join([str(w) for w in warns_fit]))
