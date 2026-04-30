@@ -77,7 +77,7 @@ except Exception:
 DEFAULT_MERGED_H5 = r"D:\4.DATASETS\MODELS_CH3OCHO_ENSEMBLES_PERCHANNEL_ROI_dynamicrange_v2_PER_ROI"
 DEFAULT_NOISE_NN_H5 = ""
 DEFAULT_FILTER_FILE = ""
-DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1uSZRFgBIqytuJqv0-IeYPm5D57lCIZVz?usp=sharing"
+DEFAULT_GDRIVE_MODELS_LINK = "https://drive.google.com/drive/folders/1eV0TVZbhOe9ouW76cNgerZ89R4KNTBTw?usp=drive_link"
 
 # Local preset (Windows)
 
